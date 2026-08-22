@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: autogen-backend-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health

@@ -16,7 +16,7 @@ from fastapi import (
 
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 
 from docx import Document
 
@@ -578,12 +578,13 @@ async def generate_documents(
                 except Exception as error:
 
                     raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            f"PDF generation failed for "
-                            f"{Path(docx_file).name}: {error}"
-                        )
-                    )
+                    status_code=500,
+                    detail={
+                        "message": "PDF generation failed.",
+                        "file": Path(docx_file).name,
+                        "error": str(error),
+                    }
+                )
 
                 generated_files.append(
                     pdf_file
@@ -614,8 +615,10 @@ async def generate_documents(
         # Return ZIP
         # ----------------------------------------------------
 
-        return StreamingResponse(
-            zip_buffer,
+        zip_bytes = zip_buffer.getvalue()
+
+        return Response(
+            content=zip_bytes,
             media_type="application/zip",
             headers={
                 "Content-Disposition":
