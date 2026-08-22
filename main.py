@@ -1,6 +1,7 @@
 import io
 import os
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -38,7 +39,168 @@ from document_processor import (
 # False:
 #     PDF generation is disabled completely.
 #
-GENERATE_PDF = False
+GENERATE_PDF = True
+
+
+# ============================================================
+# PDF CONVERSION
+# ============================================================
+
+def find_libreoffice():
+    """
+    Find the LibreOffice executable.
+
+    The environment variable LIBREOFFICE_PATH can be used to
+    explicitly specify the executable path.
+
+    Examples:
+        Windows:
+            C:\\Program Files\\LibreOffice\\program\\soffice.exe
+
+        Linux:
+            /usr/bin/soffice
+    """
+
+    configured_path = os.getenv("LIBREOFFICE_PATH")
+
+    if configured_path:
+        configured = Path(configured_path)
+
+        if configured.exists():
+            return str(configured)
+
+        # It may be an executable available on PATH.
+        found = shutil.which(configured_path)
+
+        if found:
+            return found
+
+    # Standard PATH lookup.
+    found = shutil.which("soffice")
+
+    if found:
+        return found
+
+    found = shutil.which("libreoffice")
+
+    if found:
+        return found
+
+    # Common Windows installation locations.
+    windows_paths = [
+        Path(os.environ.get("PROGRAMFILES", ""))
+        / "LibreOffice"
+        / "program"
+        / "soffice.exe",
+
+        Path(os.environ.get("PROGRAMFILES(X86)", ""))
+        / "LibreOffice"
+        / "program"
+        / "soffice.exe",
+    ]
+
+    for path in windows_paths:
+        if path.exists():
+            return str(path)
+
+    return None
+
+
+def convert_docx_to_pdf(
+    docx_path,
+    output_folder
+):
+    """
+    Convert one DOCX file to PDF using LibreOffice.
+
+    The PDF is written into output_folder and the resulting
+    PDF path is returned.
+    """
+
+    docx_path = Path(docx_path)
+    output_folder = Path(output_folder)
+
+    output_folder.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    soffice = find_libreoffice()
+
+    if not soffice:
+        raise RuntimeError(
+            "PDF generation was requested, but LibreOffice "
+            "could not be found. Install LibreOffice and make "
+            "sure 'soffice' is available, or set the "
+            "LIBREOFFICE_PATH environment variable."
+        )
+
+    # Give each conversion its own LibreOffice profile.
+    # This prevents profile locking when multiple requests
+    # are processed by the API.
+    profile_dir = Path(
+        tempfile.mkdtemp(
+            prefix="autogen-libreoffice-profile-"
+        )
+    )
+
+    try:
+
+        command = [
+            soffice,
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(output_folder),
+            f"-env:UserInstallation={profile_dir.as_uri()}",
+            str(docx_path),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            details = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Unknown LibreOffice error."
+            )
+
+            raise RuntimeError(
+                f"LibreOffice PDF conversion failed for "
+                f"{docx_path.name}: {details}"
+            )
+
+        pdf_path = (
+            output_folder /
+            f"{docx_path.stem}.pdf"
+        )
+
+        if not pdf_path.exists():
+            raise RuntimeError(
+                f"LibreOffice completed without creating "
+                f"the expected PDF for {docx_path.name}."
+            )
+
+        return pdf_path
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"PDF conversion timed out for {docx_path.name}."
+        )
+
+    finally:
+
+        shutil.rmtree(
+            profile_dir,
+            ignore_errors=True
+        )
 
 
 # ============================================================
@@ -47,7 +209,7 @@ GENERATE_PDF = False
 
 app = FastAPI(
     title="Document Generator API",
-    version="1.0.0"
+    version="1.0.1"
 )
 
 
@@ -249,7 +411,8 @@ async def inspect_files(
 @app.post("/generate")
 async def generate_documents(
     template: UploadFile = File(...),
-    data_json: str = Form(...),
+    data_json: str | None = Form(None),
+    rows: str | None = Form(None),
     generate_pdf: bool = Form(False)
 ):
 
@@ -276,17 +439,26 @@ async def generate_documents(
 
     import json
 
+    # The original API uses "data_json".
+    # The current Next.js UI may send "rows".
+    # Accept both so the frontend and backend remain compatible.
+    payload = data_json if data_json is not None else rows
+
+    if payload is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No client data was supplied."
+        )
+
     try:
 
-        records = json.loads(
-            data_json
-        )
+        records = json.loads(payload)
 
     except json.JSONDecodeError:
 
         raise HTTPException(
             status_code=400,
-            detail="Invalid data_json."
+            detail="Invalid client data JSON."
         )
 
     if not isinstance(
@@ -389,32 +561,33 @@ async def generate_documents(
             )
 
         # ----------------------------------------------------
-        # PDF placeholder
+        # PDF conversion
         # ----------------------------------------------------
-        #
-        # We intentionally do not convert PDF yet.
-        #
-        # Once PDF conversion is added, this section will
-        # create the PDF next to the DOCX file.
-        #
 
         if generate_pdf:
 
-            # PDF conversion will be implemented here.
-            #
-            # For now:
-            #
-            # raise an error instead of silently pretending
-            # that PDFs were generated.
+            for docx_file in list(generated_files):
 
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    "PDF generation is enabled but "
-                    "the PDF conversion engine has not "
-                    "yet been configured."
+                try:
+
+                    pdf_file = convert_docx_to_pdf(
+                        docx_path=docx_file,
+                        output_folder=output_dir
+                    )
+
+                except Exception as error:
+
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"PDF generation failed for "
+                            f"{Path(docx_file).name}: {error}"
+                        )
+                    )
+
+                generated_files.append(
+                    pdf_file
                 )
-            )
 
         # ----------------------------------------------------
         # Create ZIP
@@ -446,7 +619,7 @@ async def generate_documents(
             media_type="application/zip",
             headers={
                 "Content-Disposition":
-                    'attachment; filename="receipts.zip"'
+                    'attachment; filename="Autogen_Receipts.zip"'
             }
         )
 
