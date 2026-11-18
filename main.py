@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import threading
+import time
 from pathlib import Path
 
 from fastapi import (
@@ -209,8 +211,62 @@ def convert_docx_to_pdf(
 
 app = FastAPI(
     title="Document Generator API",
-    version="1.0.1"
+    version="1.1.0"
 )
+
+
+# ============================================================
+# GENERATION PROGRESS STORE
+# ============================================================
+
+# Progress is kept in memory for the lifetime of this API process.
+# The frontend polls this state while the /generate request returns
+# the ZIP directly when processing is complete.
+_generation_progress = {}
+_generation_progress_lock = threading.Lock()
+_PROGRESS_TTL_SECONDS = 3600
+
+
+def set_generation_progress(
+    request_id,
+    *,
+    status="processing",
+    percent=0,
+    message="Preparing generation...",
+    completed=0,
+    total=0,
+):
+    now = time.time()
+    with _generation_progress_lock:
+        # Discard old entries periodically so this dictionary stays bounded.
+        expired = [
+            key for key, value in _generation_progress.items()
+            if now - value.get("updated_at", now) > _PROGRESS_TTL_SECONDS
+        ]
+        for key in expired:
+            _generation_progress.pop(key, None)
+
+        _generation_progress[request_id] = {
+            "request_id": request_id,
+            "status": status,
+            "percent": max(0, min(100, int(percent))),
+            "message": message,
+            "completed": int(completed),
+            "total": int(total),
+            "updated_at": now,
+        }
+
+
+def get_generation_progress(request_id):
+    with _generation_progress_lock:
+        progress = _generation_progress.get(request_id)
+        if progress is None:
+            return None
+        # Do not expose the internal timestamp.
+        return {
+            key: value for key, value in progress.items()
+            if key != "updated_at"
+        }
 
 
 # ============================================================
@@ -405,15 +461,31 @@ async def inspect_files(
 
 
 # ============================================================
+# GENERATION PROGRESS
+# ============================================================
+
+@app.get("/generate/progress/{request_id}")
+def read_generation_progress(request_id: str):
+    progress = get_generation_progress(request_id)
+    if progress is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Generation progress was not found."
+        )
+    return progress
+
+
+# ============================================================
 # GENERATE DOCUMENTS
 # ============================================================
 
 @app.post("/generate")
-async def generate_documents(
+def generate_documents(
     template: UploadFile = File(...),
     data_json: str | None = Form(None),
     rows: str | None = Form(None),
-    generate_pdf: bool = Form(False)
+    generate_pdf: bool = Form(False),
+    request_id: str = Form(...)
 ):
 
     # --------------------------------------------------------
@@ -485,6 +557,21 @@ async def generate_documents(
             )
         )
 
+    if not request_id or len(request_id) > 128:
+        raise HTTPException(
+            status_code=400,
+            detail="A valid request_id is required for progress tracking."
+        )
+
+    set_generation_progress(
+        request_id,
+        status="processing",
+        percent=0,
+        message="Preparing your receipts...",
+        completed=0,
+        total=len(records),
+    )
+
     # --------------------------------------------------------
     # Temporary workspace
     # --------------------------------------------------------
@@ -527,37 +614,39 @@ async def generate_documents(
         # ----------------------------------------------------
 
         generated_files = []
+        total_records = len(records)
+        # Count each concrete unit of work: one DOCX generation,
+        # one PDF conversion when enabled, and one ZIP file addition.
+        total_work_units = total_records * (4 if generate_pdf else 2)
+        completed_work_units = 0
 
-        for index, record in enumerate(
-            records,
-            start=1
-        ):
+        # ----------------------------------------------------
+        # Generate DOCX receipts
+        # ----------------------------------------------------
 
-            if not isinstance(
-                record,
-                dict
-            ):
-
+        for index, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
                 raise HTTPException(
                     status_code=400,
-                    detail=(
-                        f"Row {index} is invalid."
-                    )
+                    detail=f"Row {index} is invalid."
                 )
 
             output_file = generate_document(
-                template_file=str(
-                    template_path
-                ),
-                output_folder=str(
-                    output_dir
-                ),
+                template_file=str(template_path),
+                output_folder=str(output_dir),
                 data=record,
                 row_number=index
             )
 
-            generated_files.append(
-                output_file
+            generated_files.append(output_file)
+            completed_work_units += 1
+            percent = round(100 * completed_work_units / total_work_units)
+            set_generation_progress(
+                request_id,
+                percent=percent,
+                message=f"Generating receipt {index} of {total_records}...",
+                completed=completed_work_units,
+                total=total_work_units,
             )
 
         # ----------------------------------------------------
@@ -565,18 +654,14 @@ async def generate_documents(
         # ----------------------------------------------------
 
         if generate_pdf:
-
-            for docx_file in list(generated_files):
-
+            docx_files = list(generated_files)
+            for index, docx_file in enumerate(docx_files, start=1):
                 try:
-
                     pdf_file = convert_docx_to_pdf(
                         docx_path=docx_file,
                         output_folder=output_dir
                     )
-
                 except Exception as error:
-
                     raise HTTPException(
                         status_code=500,
                         detail=(
@@ -585,30 +670,50 @@ async def generate_documents(
                         )
                     )
 
-                generated_files.append(
-                    pdf_file
+                generated_files.append(pdf_file)
+                completed_work_units += 1
+                percent = round(100 * completed_work_units / total_work_units)
+                set_generation_progress(
+                    request_id,
+                    percent=percent,
+                    message=f"Converting PDF {index} of {len(docx_files)}...",
+                    completed=completed_work_units,
+                    total=total_work_units,
                 )
 
         # ----------------------------------------------------
-        # Create ZIP
+        # Create ZIP and report each file added
         # ----------------------------------------------------
 
         zip_buffer = io.BytesIO()
+        total_files_to_zip = len(generated_files)
 
         with zipfile.ZipFile(
             zip_buffer,
             mode="w",
             compression=zipfile.ZIP_DEFLATED
         ) as zip_file:
-
-            for file_path in generated_files:
-
-                zip_file.write(
-                    file_path,
-                    arcname=file_path.name
+            for index, file_path in enumerate(generated_files, start=1):
+                zip_file.write(file_path, arcname=file_path.name)
+                completed_work_units += 1
+                percent = round(100 * completed_work_units / total_work_units)
+                set_generation_progress(
+                    request_id,
+                    percent=percent,
+                    message=f"Adding file {index} of {total_files_to_zip} to ZIP...",
+                    completed=completed_work_units,
+                    total=total_work_units,
                 )
 
         zip_buffer.seek(0)
+        set_generation_progress(
+            request_id,
+            status="completed",
+            percent=100,
+            message="ZIP archive ready.",
+            completed=total_work_units,
+            total=total_work_units,
+        )
 
         # ----------------------------------------------------
         # Return ZIP
@@ -623,11 +728,26 @@ async def generate_documents(
             }
         )
 
-    except HTTPException:
+    except HTTPException as error:
+        set_generation_progress(
+            request_id,
+            status="failed",
+            percent=0,
+            message=str(error.detail),
+            completed=0,
+            total=len(records),
+        )
         raise
 
     except Exception as error:
-
+        set_generation_progress(
+            request_id,
+            status="failed",
+            percent=0,
+            message=str(error),
+            completed=0,
+            total=len(records),
+        )
         raise HTTPException(
             status_code=500,
             detail=str(error)
